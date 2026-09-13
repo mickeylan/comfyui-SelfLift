@@ -71,6 +71,7 @@ A controlled single-seed H3 run found: clean native baseline and clean pure pixe
 - `[H3 TST]` — TST per-forward diagnostics
 - `SELFLIFT_TIMING_SYNC=1` — CUDA-synchronized timing (slower; for diagnostics)
 - `SELFLIFT_MEMORY_LOG=1` — host/device memory snapshots at stage boundaries
+- `latent_diagnostics` — writes a small JSON report under `output/selflift_diagnostics/` with latent RMS and normalized spatial gradients near 0.5, 1.5 and 3.5 seconds for the low-resolution endpoint, lifted endpoint, optional pixel anchor and final output; no extra VAE decode
 - `SELFLIFT_DEBUG=1` — dump transition intermediates as PNGs under `debug/` (slow, memory-hungry)
 - `SELFLIFT_TST_EXACT=1` — TST exact-operator calibration probe (debug only)
 

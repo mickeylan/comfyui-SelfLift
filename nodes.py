@@ -32,7 +32,7 @@ from . import selflift
 from . import h3_upscaler
 from . import h3_tiling
 from . import h3_tst
-from .diagnostics import log_memory
+from .diagnostics import latent_detail_profile, log_memory, write_latent_diagnostics
 
 
 class _StageTimer:
@@ -228,7 +228,7 @@ def _debug_dump(vae, latents):
 
 def progressive_sample(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
                        transition_step, lowres_scale, rho, w_min, w_max, latent_upsample, latent_lifter=None,
-                       highres_tiling=False, model_hires=None):
+                       highres_tiling=False, model_hires=None, latent_diagnostics=False):
     _validate_schedule(sigmas, transition_step)
     if sigmas.numel() < 2:
         return latent_image
@@ -241,6 +241,8 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     noise_mask = _validate_latent_input(latent_image)
     if highres_tiling and noise_mask is not None:
         raise ValueError("SelfLift: noise_mask is not compatible with highres_tiling")
+    diagnostics_enabled = bool(latent_diagnostics) or os.environ.get("SELFLIFT_LATENT_DIAGNOSTICS", "0") == "1"
+    diagnostic_stages = {}
 
     model_sampling = model.get_model_object("model_sampling")
     _validate_sampling(model_sampling, sampler)
@@ -388,6 +390,8 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
                       for state, denoised in zip(low_streams[1:], x0_streams[1:])]
     latent_format = model.get_model_object("latent_format")
     z0_low_vae = latent_format.process_out(x0_streams[0].float()).to(device)
+    if diagnostics_enabled and video:
+        diagnostic_stages["low_resolution_endpoint"] = latent_detail_profile(z0_low_vae)
     del low_latent, noise_low, low_streams, x0_streams, positive_low, negative_low
     transition_timer.mark("prepare_endpoint")
     log_memory("transition endpoint_ready", model.load_device)
@@ -400,6 +404,10 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
         need_lat=need_lat, need_pix=need_pix)
     transition_timer.mark("paired_lifts")
     log_memory("transition lifts_ready", model.load_device)
+    if diagnostics_enabled and video and z_lat_vae is not None:
+        diagnostic_stages["lifted_endpoint"] = latent_detail_profile(z_lat_vae)
+    if diagnostics_enabled and video and z_pix_vae is not None:
+        diagnostic_stages["pixel_anchor"] = latent_detail_profile(z_pix_vae)
     z_lat = latent_format.process_in(z_lat_vae) if z_lat_vae is not None else None
     z_pix = latent_format.process_in(z_pix_vae) if z_pix_vae is not None else None
     z0_high = selflift.artifact_aware_consistency_lift(z_lat, z_pix, rho, w_min, w_max, mask=m_full)
@@ -460,6 +468,16 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     result = latent_image.copy()
     result["samples"] = out.to(device=comfy.model_management.intermediate_device(),
                                 dtype=comfy.model_management.intermediate_dtype())
+    if diagnostics_enabled and video:
+        final_streams, _ = _streams(result["samples"])
+        diagnostic_stages["final_output"] = latent_detail_profile(
+            latent_format.process_out(final_streams[0].float()))
+        write_latent_diagnostics(diagnostic_stages, {
+            "transition_step": int(transition_step), "total_steps": int(total_steps),
+            "lowres_scale": float(lowres_scale), "rho": float(rho),
+            "w_min": float(w_min), "w_max": float(w_max),
+            "highres_tiling": bool(highres_tiling),
+        }, enabled=True)
     high_timer.finish()
     log_memory("high_resolution end", model.load_device)
     return result
@@ -487,6 +505,7 @@ class SelfLiftH3Sampler:
         }, "optional": {
             "model_hires": ("MODEL", {"tooltip": "Optional: model used for the high-resolution stage instead of `model` (e.g. a different checkpoint or LoRA stack). Must share the same architecture and latent format. The low-resolution prefix always runs on `model`."}),
             "highres_tiling": ("BOOLEAN", {"default": False, "label_on": "高分辨率分块：开启", "label_off": "高分辨率分块：关闭", "tooltip": "Experimental: select 1–8 spatial tiles from available memory at high-resolution preparation. Audio input and references remain complete; only the first tile's audio prediction is retained. Quality and speed may change."}),
+            "latent_diagnostics": ("BOOLEAN", {"default": False, "label_on": "Latent诊断：开启", "label_off": "Latent诊断：关闭", "tooltip": "Write a small JSON report for low-resolution, lifted, and final latent detail at 0.5/1.5/3.5 seconds. Does not decode extra video frames."}),
         }}
 
     RETURN_TYPES = ("LATENT",)
@@ -494,7 +513,8 @@ class SelfLiftH3Sampler:
     CATEGORY = "selflift"
 
     def sample(self, model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
-               transition_step, lowres_scale, rho, w_min, w_max, upscaler_model, model_hires=None, highres_tiling=False):
+               transition_step, lowres_scale, rho, w_min, w_max, upscaler_model, model_hires=None,
+               highres_tiling=False, latent_diagnostics=False):
         if rho == 0.0 and upscaler_model == "none":
             raise ValueError(
                 "SelfLift H3: rho=0 with upscaler_model=none disables both SelfLift-zero correction "
@@ -507,7 +527,8 @@ class SelfLiftH3Sampler:
             lifter = lambda z, hw: h3_upscaler.learned_latent_lift(z, hw, upscaler_model)
         return (progressive_sample(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
                                    transition_step, lowres_scale, rho, w_min, w_max, "nearest",
-                                   latent_lifter=lifter, highres_tiling=highres_tiling, model_hires=model_hires),)
+                                   latent_lifter=lifter, highres_tiling=highres_tiling, model_hires=model_hires,
+                                   latent_diagnostics=latent_diagnostics),)
 
 
 class SelfLiftImageSampler:
